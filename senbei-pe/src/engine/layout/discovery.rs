@@ -223,24 +223,116 @@ pub fn find_tbl_pe32(data: &[u8], info: &[u32; 8]) -> Option<u32> {
     let hi = (shell as u64)
         .saturating_add(0x3000)
         .min(data.len() as u64 - 0x100) as u32;
-    let mut off = shell;
-    while off < hi {
-        if off as usize + 8 <= data.len() {
-            let candidate = off.wrapping_sub(0x88);
-            if candidate >= shell && get_u32(data, off) == info[6] {
-                let shell_size_val = get_u32(data, off.wrapping_add(4));
-                if shell_size_val > 0x1000 && shell_size_val < 0x100000 {
-                    let v58_off = candidate.wrapping_add(0x58);
-                    if (v58_off as usize + 4) <= data.len() {
-                        let v58 = get_u32(data, v58_off);
-                        if v58 > 0 && (v58 as usize) < data.len() {
-                            return Some(candidate);
+    let scan = |require_checksum_pointer: bool| -> Option<u32> {
+        let mut off = shell;
+        while off < hi {
+            if off as usize + 8 <= data.len() {
+                let candidate = off.wrapping_sub(0x88);
+                if candidate >= shell && get_u32(data, off) == info[6] {
+                    let shell_size_val = get_u32(data, off.wrapping_add(4));
+                    if shell_size_val > 0x1000 && shell_size_val < 0x100000 {
+                        let checksum_slot = candidate.wrapping_add(0x58);
+                        if checksum_slot as usize + 4 <= data.len() {
+                            let checksum_pointer = get_u32(data, checksum_slot);
+                            let pointer_valid =
+                                checksum_pointer > 0 && (checksum_pointer as usize) < data.len();
+                            if require_checksum_pointer && pointer_valid {
+                                return Some(candidate);
+                            }
+                            if !require_checksum_pointer && checksum_pointer == 0 {
+                                let stage = candidate.wrapping_add(0x98);
+                                if stage as usize + 8 <= data.len() {
+                                    let offset = get_u32(data, stage);
+                                    let size = get_u32(data, stage.wrapping_add(4));
+                                    if offset > 0x1000
+                                        && (offset as usize) < data.len()
+                                        && size >= 4
+                                        && (offset as usize).saturating_add(size as usize)
+                                            <= data.len()
+                                    {
+                                        return Some(candidate);
+                                    }
+                                }
+                            }
                         }
                     }
                 }
             }
+            off = off.wrapping_add(4);
         }
-        off = off.wrapping_add(4);
+        None
+    };
+    scan(true).or_else(|| scan(false))
+}
+
+/// Locate the config block's shell self-reference in a plain-shell PE32 image.
+/// The adjacent shell extent and SecondStage descriptor validate the candidate.
+pub fn find_plain_shell_anchor(data: &[u8]) -> Option<u32> {
+    let image_len = data.len() as u32;
+    if image_len < 0x200 {
+        return None;
+    }
+    let mut offset = 0x88u32;
+    while offset as usize + 8 <= data.len() {
+        let shell = get_u32(data, offset);
+        let delta = offset.wrapping_sub(shell);
+        if shell > 0x1000 && (0x88..0x3000).contains(&delta) {
+            let shell_size = get_u32(data, offset.wrapping_add(4));
+            if shell_size > 0x1000 && shell_size < 0x100000 {
+                let second_stage = offset.wrapping_add(0x10);
+                if second_stage as usize + 8 <= data.len() {
+                    let stage_offset = get_u32(data, second_stage);
+                    let stage_size = get_u32(data, second_stage.wrapping_add(4));
+                    if stage_offset > 0x1000
+                        && stage_offset < image_len
+                        && stage_size >= 4
+                        && (stage_offset as usize).saturating_add(stage_size as usize) <= data.len()
+                    {
+                        return Some(shell);
+                    }
+                }
+            }
+        }
+        offset = offset.wrapping_add(4);
+    }
+    None
+}
+
+/// Locate the PE32 stage-descriptor array by its repeated 16-byte record shape.
+/// Earlier layouts carry variable SecondStage padding, so size-relative offsets
+/// alone are not reliable.
+pub fn find_pe32_dp_base(data: &[u8], second_stage: u32, stage_size: u32) -> Option<u32> {
+    const MIN_RECORDS: u32 = 8;
+    if stage_size < MIN_RECORDS * 16 {
+        return None;
+    }
+    let image_len = data.len() as u32;
+    let record_at = |offset: u32| -> bool {
+        let base = second_stage.wrapping_add(offset);
+        if base as usize + 16 > data.len() {
+            return false;
+        }
+        let source = get_u32(data, base);
+        let source_size = get_u32(data, base.wrapping_add(4));
+        let destination = get_u32(data, base.wrapping_add(8));
+        let destination_size = get_u32(data, base.wrapping_add(12));
+        source == destination
+            && source > 0x1000
+            && source < image_len
+            && source_size > 0
+            && source_size <= destination_size
+            && destination_size < image_len
+    };
+    let mut offset = 0u32;
+    while offset + MIN_RECORDS * 16 <= stage_size {
+        let mut count = 0u32;
+        while offset + (count + 1) * 16 <= stage_size && record_at(offset + count * 16) {
+            count += 1;
+        }
+        if count >= MIN_RECORDS {
+            return Some(offset);
+        }
+        offset = offset.wrapping_add(4);
     }
     None
 }

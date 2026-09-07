@@ -153,6 +153,16 @@ Several protected stages are themselves little bytecode programs. The core
 includes a small VM (`bytecode.rs`) that generates and interprets those
 programs rather than hardcoding each variant's constants.
 
+Earlier PE32 families have two additional structural variants. Some move the
+config checksum chain and stage-key fields, so the pipeline locates descriptor
+arrays by shape and accepts a candidate only when the following stage
+decompresses. The earliest family stores the shell and ciphertext in plain PE
+sections, embeds the header key table in the entry stub, and temporarily lays
+that stub over part of the compressed stream. For that family the pipeline
+recreates the loader's section mapping, derives compressed-source offsets from
+the section table, and splices the shell's saved bytes over the displaced range
+before decompression.
+
 ## The Android pipeline
 
 The Android scheme hollows an ELF64/AArch64 shared object: section bodies are

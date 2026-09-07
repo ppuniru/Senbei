@@ -30,19 +30,48 @@ impl<'a> Unpacker<'a> {
             println!("  tbl = 0x{:X}", tbl);
         }
 
+        // Earlier PE32 layouts terminate the checksum chain at `tbl+0x58`
+        // immediately and keep the active chain at `tbl+0x60`.
+        let old_layout = get_u32(&self.decompressed, tbl.wrapping_add(0x5C)) == 0;
+        if old_layout {
+            let payload_lo = info3 as usize;
+            let payload_hi = payload_lo
+                .saturating_add(self.decrypt_size.max(info[5]) as usize)
+                .min(self.decompressed.len());
+            self.map_raw_sections(pe_off, payload_lo, payload_hi);
+        }
+
         // ---- PE header restore ----
         let val_bc = get_u32(&self.decompressed, tbl.wrapping_add(0xBC));
-        let val_c8 = get_u32(&self.decompressed, tbl.wrapping_add(0xC8));
-        let val_cc = get_u32(&self.decompressed, tbl.wrapping_add(0xCC));
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0x80), val_bc);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0x88), val_c8);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0x8C), val_cc);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0xB0), 0);
-        write_u32(&mut self.decompressed, pe_off.wrapping_add(0xB4), 0);
+        let (val_88, val_8c) = if old_layout {
+            (
+                get_u32(&self.decompressed, tbl.wrapping_add(0xC0)),
+                get_u32(&self.decompressed, tbl.wrapping_add(0xC4)),
+            )
+        } else {
+            (
+                get_u32(&self.decompressed, tbl.wrapping_add(0xC8)),
+                get_u32(&self.decompressed, tbl.wrapping_add(0xCC)),
+            )
+        };
+        let image_len = self.decompressed.len() as u64;
+        let plausible = |value: u32| (value as u64) < image_len;
+        if plausible(val_bc) && plausible(val_88) && plausible(val_8c) {
+            write_u32(&mut self.decompressed, pe_off.wrapping_add(0x80), val_bc);
+            write_u32(&mut self.decompressed, pe_off.wrapping_add(0x88), val_88);
+            write_u32(&mut self.decompressed, pe_off.wrapping_add(0x8C), val_8c);
+            if old_layout {
+                write_u32(&mut self.decompressed, pe_off.wrapping_add(0xA0), 0);
+                write_u32(&mut self.decompressed, pe_off.wrapping_add(0xA4), 0);
+            } else {
+                write_u32(&mut self.decompressed, pe_off.wrapping_add(0xB0), 0);
+                write_u32(&mut self.decompressed, pe_off.wrapping_add(0xB4), 0);
+            }
+        }
 
         // ---- Header-independent checksum inputs ----
         let first_stage_cs = self.calculate_checksum(tbl.wrapping_add(0xA8));
-        let second_stage_key = get_u32(&self.decompressed, tbl.wrapping_add(0x40));
+        let second_stage_key_offsets: &[u32] = if old_layout { &[0x48, 0x50] } else { &[0x40] };
 
         // ---- Stage 3: SecondStage ----
         //
@@ -84,27 +113,46 @@ impl<'a> Unpacker<'a> {
         // Holds the winning variant's header checksum; the later stages
         // (Forth/Fifth/Seven/Eighth) reuse it as a key component.
         let mut header_checksum: u32 = 0;
-        for zero_reloc in [false, true] {
-            if zero_reloc {
-                write_u32(&mut self.decompressed, reloc_dir, 0);
-                write_u32(&mut self.decompressed, reloc_dir.wrapping_add(4), 0);
-            }
-            let mut hcs_addr = tbl.wrapping_add(0x58);
-            header_checksum = 0;
-            while get_u32(&self.decompressed, hcs_addr.wrapping_add(4)) != 0 {
-                header_checksum ^= self.calculate_checksum(hcs_addr);
-                hcs_addr = hcs_addr.wrapping_add(8);
-            }
-            let ss_key = header_checksum ^ first_stage_cs ^ second_stage_key;
-            self.decompressed[ss_lo..ss_hi].copy_from_slice(&ss_ct);
-            self.decrypt_data3(ss_pair, ss_key, 21);
-            // Validate: the ThirdStage (off,size) pair must reference the image.
-            let pair = ss.wrapping_add(pair_off);
-            let off = get_u32(&self.decompressed, pair) as u64;
-            let sz = get_u32(&self.decompressed, pair.wrapping_add(4)) as u64;
-            if off > 0x1000 && off < len && sz >= 4 && off.saturating_add(sz) <= len {
-                found = true;
-                break;
+        let relocation_backup = (
+            get_u32(&self.decompressed, reloc_dir),
+            get_u32(&self.decompressed, reloc_dir.wrapping_add(4)),
+        );
+        'second_stage: for &key_offset in second_stage_key_offsets {
+            let second_stage_key = get_u32(&self.decompressed, tbl.wrapping_add(key_offset));
+            for zero_reloc in [false, true] {
+                let relocation = if zero_reloc {
+                    (0, 0)
+                } else {
+                    relocation_backup
+                };
+                write_u32(&mut self.decompressed, reloc_dir, relocation.0);
+                write_u32(
+                    &mut self.decompressed,
+                    reloc_dir.wrapping_add(4),
+                    relocation.1,
+                );
+                let mut hcs_addr = tbl.wrapping_add(if old_layout { 0x60 } else { 0x58 });
+                header_checksum = 0;
+                while get_u32(&self.decompressed, hcs_addr.wrapping_add(4)) != 0 {
+                    header_checksum ^= self.calculate_checksum(hcs_addr);
+                    hcs_addr = hcs_addr.wrapping_add(8);
+                }
+                let ss_key = header_checksum ^ first_stage_cs ^ second_stage_key;
+                self.decompressed[ss_lo..ss_hi].copy_from_slice(&ss_ct);
+                self.decrypt_data3(ss_pair, ss_key, 21);
+                let pair = ss.wrapping_add(pair_off);
+                let off = get_u32(&self.decompressed, pair) as u64;
+                let size = get_u32(&self.decompressed, pair.wrapping_add(4)) as u64;
+                if off > 0x1000 && off < len && size >= 4 && off.saturating_add(size) <= len {
+                    found = true;
+                    break 'second_stage;
+                }
+                if old_layout
+                    && layout::find_pe32_dp_base(&self.decompressed, ss, ss_size).is_some()
+                {
+                    found = true;
+                    break 'second_stage;
+                }
             }
         }
         if !found {
@@ -117,69 +165,120 @@ impl<'a> Unpacker<'a> {
             );
         }
 
-        // ---- PE32 fixed offsets ----
-        let third_key_off = 0x968u32.wrapping_add(ss_shift);
-        let forth_key_off = 0x964u32.wrapping_add(ss_shift);
-        let cs_base_off = 0x96Cu32.wrapping_add(ss_shift);
-        let dp_base_off = 0xA9Cu32.wrapping_add(ss_shift);
+        // Earlier layouts carry variable padding at the end of SecondStage, so
+        // find the repeated stage descriptors structurally there.
+        let dp_base_off = if old_layout {
+            layout::find_pe32_dp_base(&self.decompressed, ss, ss_size)
+                .ok_or(UnpackError::Pe32ThirdStageFailed)?
+        } else {
+            0xA9Cu32.wrapping_add(ss_shift)
+        };
+        let third_pair_off = if old_layout {
+            dp_base_off.wrapping_add(0xF0)
+        } else {
+            0xB8Cu32.wrapping_add(ss_shift)
+        };
 
-        // ---- Stage 4: ThirdStage (brute-force the rotate shift) ----
-        let third_pair_off = 0xB8Cu32.wrapping_add(ss_shift);
-        let key = get_u32(&self.decompressed, ss.wrapping_add(third_key_off));
+        // ---- Stage 4: ThirdStage (trial key location and rotate shift) ----
         let pair_addr = ss.wrapping_add(third_pair_off);
         let ts_addr = get_u32(&self.decompressed, pair_addr);
         let ts_size_raw = get_u32(&self.decompressed, pair_addr.wrapping_add(4));
+        if ts_addr <= 0x1000
+            || (ts_addr as usize).saturating_add(ts_size_raw as usize) > self.decompressed.len()
+            || ts_size_raw < 0x20
+        {
+            return Err(UnpackError::Pe32ThirdStageFailed);
+        }
         let backup: Vec<u8> =
             self.decompressed[ts_addr as usize..(ts_addr + ts_size_raw) as usize].to_vec();
+        let mut key_offsets = vec![0x968u32.wrapping_add(ss_shift)];
+        if old_layout {
+            let mut offset = 0u32;
+            while offset + 4 <= ss_size {
+                if offset != key_offsets[0]
+                    && get_u32(&self.decompressed, ss.wrapping_add(offset)) != 0
+                {
+                    key_offsets.push(offset);
+                }
+                offset = offset.wrapping_add(4);
+            }
+        }
+        let checksum_descriptors_valid = |data: &[u8], key_offset: u32| -> bool {
+            let image_len = data.len() as u64;
+            (0..3u32).all(|index| {
+                let descriptor = ss
+                    .wrapping_add(key_offset)
+                    .wrapping_add(4 + index.wrapping_mul(8));
+                if descriptor as usize + 8 > data.len() {
+                    return false;
+                }
+                let offset = get_u32(data, descriptor) as u64;
+                let size = get_u32(data, descriptor.wrapping_add(4)) as u64;
+                offset > 0x1000 && size > 0 && offset.saturating_add(size) <= image_len
+            })
+        };
         let mut info_table: Option<u32> = None;
         let mut keys_addr: u32 = 0;
         let mut ts: u32 = 0;
-        for &shift in &[19u32, 21, 17, 23, 15, 25, 13, 11] {
-            self.decompressed[ts_addr as usize..(ts_addr + ts_size_raw) as usize]
-                .copy_from_slice(&backup);
-            write_u32(&mut self.decompressed, pair_addr, ts_addr);
-            write_u32(
-                &mut self.decompressed,
-                pair_addr.wrapping_add(4),
-                ts_size_raw,
-            );
-            self.decrypt_data3(pair_addr, key, shift);
-            let mut off = 0u32;
-            while off + 32 < ts_size_raw {
-                let t0 = get_u32(&self.decompressed, ts_addr.wrapping_add(off));
-                if t0 == 1 || t0 == 0x11 {
-                    let t1 = get_u32(&self.decompressed, ts_addr.wrapping_add(off + 16));
-                    if t1 == 2 {
-                        let addr0 = get_u32(&self.decompressed, ts_addr.wrapping_add(off + 4));
-                        if 0x1000 < addr0 && (addr0 as usize) < self.decompressed.len() {
-                            let it = ts_addr.wrapping_add(off);
-                            info_table = Some(it);
-                            keys_addr = it.wrapping_sub(0x58);
-                            ts = ts_addr;
-                            break;
+        let mut third_key_off = key_offsets[0];
+        'third_stage: for &key_offset in &key_offsets {
+            let key = get_u32(&self.decompressed, ss.wrapping_add(key_offset));
+            for &shift in &[19u32, 21, 17, 23, 15, 25, 13, 11] {
+                self.decompressed[ts_addr as usize..(ts_addr + ts_size_raw) as usize]
+                    .copy_from_slice(&backup);
+                write_u32(&mut self.decompressed, pair_addr, ts_addr);
+                write_u32(
+                    &mut self.decompressed,
+                    pair_addr.wrapping_add(4),
+                    ts_size_raw,
+                );
+                self.decrypt_data3(pair_addr, key, shift);
+                let mut off = 0u32;
+                while off + 32 < ts_size_raw {
+                    let t0 = get_u32(&self.decompressed, ts_addr.wrapping_add(off));
+                    if t0 == 1 || t0 == 0x11 {
+                        let t1 = get_u32(&self.decompressed, ts_addr.wrapping_add(off + 16));
+                        if t1 == 2 {
+                            let addr0 = get_u32(&self.decompressed, ts_addr.wrapping_add(off + 4));
+                            if 0x1000 < addr0
+                                && (addr0 as usize) < self.decompressed.len()
+                                && checksum_descriptors_valid(&self.decompressed, key_offset)
+                            {
+                                let table = ts_addr.wrapping_add(off);
+                                info_table = Some(table);
+                                keys_addr = table.wrapping_sub(0x58);
+                                ts = ts_addr;
+                                third_key_off = key_offset;
+                                break 'third_stage;
+                            }
                         }
                     }
+                    off = off.wrapping_add(4);
                 }
-                off = off.wrapping_add(4);
-            }
-            if info_table.is_some() {
-                break;
             }
         }
         let info_table = info_table.ok_or(UnpackError::Pe32ThirdStageFailed)?;
+        let cs_base_off = third_key_off.wrapping_add(4);
+        let forth_key_off = third_key_off.wrapping_sub(4);
         if verbose {
             println!("[4/9] Decrypting stages (PE32)...");
             println!(
                 "  thirdStage start = 0x{:X}, infoTable = 0x{:X}",
                 ts, info_table
             );
+            println!(
+                "  third_key @ ss+0x{:X}, dp_base @ ss+0x{:X}",
+                third_key_off, dp_base_off
+            );
         }
 
         // ---- Process infoTable ----
         let mut it_addr = info_table;
+        let mut metadata_pointer = 0u32;
         for _ in 0..2 {
             let tval = get_u32(&self.decompressed, it_addr);
             if tval == 1 || tval == 0x11 {
+                metadata_pointer = get_u32(&self.decompressed, it_addr.wrapping_add(4));
                 self.decrypt_data4(it_addr.wrapping_add(4));
             } else if tval == 2 {
                 let mut copy_addr = get_u32(&self.decompressed, it_addr.wrapping_add(4));
@@ -215,6 +314,16 @@ impl<'a> Unpacker<'a> {
             }
             ka = ka.wrapping_add(32);
         }
+        if verbose {
+            println!(
+                "  keys_addr = 0x{:X}, key_offsets = [0x{:X}, 0x{:X}, 0x{:X}, 0x{:X}]",
+                keys_addr,
+                self.key_offsets[0],
+                self.key_offsets[1],
+                self.key_offsets[2],
+                self.key_offsets[3]
+            );
+        }
 
         // ---- Checksum addresses ----
         let second_stage_cs_addr = tbl.wrapping_add(0xB0);
@@ -224,18 +333,47 @@ impl<'a> Unpacker<'a> {
 
         // ---- ForthStage ----
         let second_stage_cs = self.calculate_checksum(second_stage_cs_addr);
-        let forth_stage_key = advance_key(
-            get_u32(&self.decompressed, ss.wrapping_add(forth_key_off)),
-            4,
-        );
         let dp_base = ss.wrapping_add(dp_base_off);
         let forth_addr = dp_base.wrapping_add(0x40);
-        let fk = header_checksum ^ second_stage_cs ^ forth_stage_key;
-        if let Err(reason) = self.decrypt_and_decompress_data(forth_addr, fk, None) {
-            return Err(UnpackError::StageDecompressionFailed {
-                stage: DecompressionStage::Pe32FourthStage,
-                reason,
-            });
+        let forth_raw = get_u32(&self.decompressed, ss.wrapping_add(forth_key_off));
+        let forth_src = get_u32(&self.decompressed, forth_addr) as usize;
+        let forth_size = get_u32(&self.decompressed, forth_addr.wrapping_add(4)) as usize;
+        let forth_descriptor = forth_addr as usize;
+        if forth_src.saturating_add(forth_size) > self.decompressed.len()
+            || forth_descriptor.saturating_add(16) > self.decompressed.len()
+        {
+            return Err(UnpackError::Pe32ThirdStageFailed);
+        }
+        let forth_backup = self.decompressed[forth_src..forth_src + forth_size].to_vec();
+        let forth_descriptor_backup =
+            self.decompressed[forth_descriptor..forth_descriptor + 16].to_vec();
+        let default_rounds = if old_layout { 2 } else { 4 };
+        let mut forth_failure = None;
+        let mut forth_ok = false;
+        for rounds in [default_rounds, 1, 2, 3, 4, 5, 6] {
+            self.decompressed[forth_src..forth_src + forth_size].copy_from_slice(&forth_backup);
+            self.decompressed[forth_descriptor..forth_descriptor + 16]
+                .copy_from_slice(&forth_descriptor_backup);
+            let key = header_checksum ^ second_stage_cs ^ advance_key(forth_raw, rounds);
+            match self.decrypt_and_decompress_data(forth_addr, key, None) {
+                Ok(()) => {
+                    if verbose {
+                        println!("  forth key walk rounds = {rounds}");
+                    }
+                    forth_ok = true;
+                    break;
+                }
+                Err(reason) => forth_failure = Some(reason),
+            }
+        }
+        if !forth_ok {
+            if let Some(reason) = forth_failure {
+                return Err(UnpackError::StageDecompressionFailed {
+                    stage: DecompressionStage::Pe32FourthStage,
+                    reason,
+                });
+            }
+            return Err(UnpackError::Pe32ThirdStageFailed);
         }
 
         // ---- FifthStage ----
@@ -271,16 +409,53 @@ impl<'a> Unpacker<'a> {
                 .wrapping_add(0x08)
                 .wrapping_add(4),
         );
-        let seven_key = !get_u32(
-            &self.decompressed,
-            cs1_addr.wrapping_add(cs1_size).wrapping_sub(0x10),
-        );
-        let fk7 = header_checksum ^ fifth_cs ^ seven_key;
-        if let Err(reason) = self.decrypt_and_decompress_data(seven_addr, fk7, None) {
-            return Err(UnpackError::StageDecompressionFailed {
-                stage: DecompressionStage::Pe32SeventhStage,
-                reason,
-            });
+        let seven_src = get_u32(&self.decompressed, seven_addr) as usize;
+        let seven_size = get_u32(&self.decompressed, seven_addr.wrapping_add(4)) as usize;
+        let seven_descriptor = seven_addr as usize;
+        if seven_src.saturating_add(seven_size) > self.decompressed.len()
+            || seven_descriptor.saturating_add(16) > self.decompressed.len()
+        {
+            return Err(UnpackError::Pe32ThirdStageFailed);
+        }
+        let seven_backup = self.decompressed[seven_src..seven_src + seven_size].to_vec();
+        let seven_descriptor_backup =
+            self.decompressed[seven_descriptor..seven_descriptor + 16].to_vec();
+        let mut seven_failure = None;
+        let mut seven_ok = false;
+        'seventh_stage: for gap in [
+            0x10u32, 0x04, 0x08, 0x0C, 0x14, 0x18, 0x1C, 0x20, 0x24, 0x28,
+        ] {
+            let key_offset = cs1_addr.wrapping_add(cs1_size).wrapping_sub(gap);
+            if key_offset as usize + 4 > self.decompressed.len() {
+                continue;
+            }
+            let raw_key = get_u32(&self.decompressed, key_offset);
+            for invert in [true, false] {
+                self.decompressed[seven_src..seven_src + seven_size].copy_from_slice(&seven_backup);
+                self.decompressed[seven_descriptor..seven_descriptor + 16]
+                    .copy_from_slice(&seven_descriptor_backup);
+                let stage_key = if invert { !raw_key } else { raw_key };
+                let key = header_checksum ^ fifth_cs ^ stage_key;
+                match self.decrypt_and_decompress_data(seven_addr, key, None) {
+                    Ok(()) => {
+                        if verbose {
+                            println!("  seven key gap = 0x{gap:X}, inverted = {invert}");
+                        }
+                        seven_ok = true;
+                        break 'seventh_stage;
+                    }
+                    Err(reason) => seven_failure = Some(reason),
+                }
+            }
+        }
+        if !seven_ok {
+            if let Some(reason) = seven_failure {
+                return Err(UnpackError::StageDecompressionFailed {
+                    stage: DecompressionStage::Pe32SeventhStage,
+                    reason,
+                });
+            }
+            return Err(UnpackError::Pe32ThirdStageFailed);
         }
 
         // ---- EighthStage ----
@@ -381,7 +556,7 @@ impl<'a> Unpacker<'a> {
             self.decompressed[eighth_addr as usize..(eighth_addr + 16) as usize]
                 .copy_from_slice(&eighth_pair_bak);
             let raw = get_u32(&self.decompressed, seven_start_actual.wrapping_add(ek_off));
-            let test_key = advance_key(raw, 3);
+            let test_key = advance_key(raw, if old_layout { 2 } else { 3 });
             let fk8 = header_checksum ^ fifth_cs ^ seven_cs ^ test_key;
             let result = primitives::decrypt_and_decompress_data(
                 &mut self.decompressed,
@@ -437,7 +612,11 @@ impl<'a> Unpacker<'a> {
                 }
                 o = o.wrapping_add(4);
             }
-            if m.is_none() {
+            for anchor in [info3, info[6]] {
+                if m.is_some() {
+                    break;
+                }
+                let info3 = anchor;
                 // fileCS-shaped slot: addr in (info3, info3+0x2000], size in
                 // 0x10..=0x200 and 16-aligned. Prefer the candidate whose addr
                 // is closest to (but past) info3 — matches every observed
@@ -480,19 +659,71 @@ impl<'a> Unpacker<'a> {
                     m = Some(base);
                 }
             }
+            if m.is_none() {
+                let image_len = self.decompressed.len() as u32;
+                let mut offset = 0x18u32;
+                while offset + 8 <= eighth_dsz {
+                    let base = offset - 0x18;
+                    if base + 0x38 > eighth_dsz {
+                        break;
+                    }
+                    let rva = get_u32(&self.decompressed, eighth_start.wrapping_add(offset));
+                    let size = get_u32(&self.decompressed, eighth_start.wrapping_add(offset + 4));
+                    let imports_valid = rva > 0x1000
+                        && rva < image_len
+                        && size >= 40
+                        && size.is_multiple_of(20)
+                        && rva.wrapping_add(size) < image_len;
+                    if imports_valid {
+                        let checksum =
+                            get_u32(&self.decompressed, eighth_start.wrapping_add(base + 0x30));
+                        let checksum_size =
+                            get_u32(&self.decompressed, eighth_start.wrapping_add(base + 0x34));
+                        if checksum > 0x1000
+                            && checksum < image_len
+                            && (0x10..=0x200).contains(&checksum_size)
+                            && checksum_size.is_multiple_of(16)
+                        {
+                            if verbose {
+                                println!(
+                                    "  pe32 cluster via import dir: base=+0x{base:X} imports=(0x{rva:X}, 0x{size:X})"
+                                );
+                            }
+                            m = Some(base);
+                            break;
+                        }
+                    }
+                    offset = offset.wrapping_add(4);
+                }
+            }
             m
         };
-        let (off_import_table, off_file_cs, off_compressed_info, off_zero_list, off_file_lfsr) =
+        if verbose {
             match marker {
-                Some(m) => (m + 0x18, m + 0x30, m + 0x40, m + 0x48, m + 0x4B4),
-                None => (
-                    0x3C50u32.wrapping_add(ss_shift),
-                    0x3C68u32.wrapping_add(ss_shift),
-                    0x3C78u32.wrapping_add(ss_shift),
-                    0x3C80u32.wrapping_add(ss_shift),
-                    0x40ECu32.wrapping_add(ss_shift),
-                ),
-            };
+                Some(offset) => println!("  eighth cluster marker = +0x{offset:X}"),
+                None => println!("  eighth cluster marker = none"),
+            }
+        }
+        let (
+            off_import_table,
+            mut off_file_cs,
+            mut off_compressed_info,
+            mut off_zero_list,
+            off_file_lfsr,
+        ) = match marker {
+            Some(m) => (m + 0x18, m + 0x30, m + 0x40, m + 0x48, m + 0x4B4),
+            None => (
+                0x3C50u32.wrapping_add(ss_shift),
+                0x3C68u32.wrapping_add(ss_shift),
+                0x3C78u32.wrapping_add(ss_shift),
+                0x3C80u32.wrapping_add(ss_shift),
+                0x40ECu32.wrapping_add(ss_shift),
+            ),
+        };
+        let compressed_info_default = off_compressed_info;
+        self.compressed_data_offset =
+            (!get_u32(self.file_data, self.header_table_offset.wrapping_add(0x80)))
+                .wrapping_add(self.header_table_offset);
 
         // ---- File checksums (permanent decrypt) ----
         let file_cs_addr_ptr = eighth_start.wrapping_add(off_file_cs);
@@ -539,22 +770,26 @@ impl<'a> Unpacker<'a> {
                 // 0x7679 cluster stamp: the expected slot is empty and the
                 // nearest loose hit is not the real decryptor.
                 let ci_slot = eighth_start.wrapping_add(off_compressed_info);
-                let mut scan = off_zero_list;
                 let mut chosen: Option<u32> = None;
                 let mut considered = 0u32;
-                while let Some(cand) = layout::find_lfsr_block(
-                    &self.decompressed,
-                    eighth_start,
-                    eighth_dsz,
-                    scan,
-                    false,
-                ) {
-                    considered = considered.wrapping_add(1);
-                    if self.pe32_file_lfsr_validates(eighth_start.wrapping_add(cand), ci_slot) {
-                        chosen = Some(cand);
-                        break;
+                'file_decryptor: for start in [off_zero_list, 0] {
+                    let mut scan = start;
+                    while let Some(candidate) = layout::find_lfsr_block(
+                        &self.decompressed,
+                        eighth_start,
+                        eighth_dsz,
+                        scan,
+                        false,
+                    ) {
+                        considered = considered.wrapping_add(1);
+                        if self
+                            .pe32_file_lfsr_validates(eighth_start.wrapping_add(candidate), ci_slot)
+                        {
+                            chosen = Some(candidate);
+                            break 'file_decryptor;
+                        }
+                        scan = candidate.wrapping_add(1);
                     }
-                    scan = cand + 1;
                 }
                 if let Some(c) = chosen {
                     if verbose {
@@ -588,20 +823,67 @@ impl<'a> Unpacker<'a> {
             // keep the first whose decoded file_ops actually decompresses the
             // first compressed data block — trial-and-validate, same idea as the
             // D1/D2 fixes. Non-DLL (EXE) builds never reach this branch.
-            let ci_slot = eighth_start.wrapping_add(off_compressed_info);
-            let mut scan = off_zero_list.wrapping_add(8);
             let mut chosen: Option<u32> = None;
-            while let Some(cand) =
-                layout::find_lfsr_block(&self.decompressed, eighth_start, eighth_dsz, scan, false)
+            let classic_offset =
+                (!get_u32(self.file_data, self.header_table_offset.wrapping_add(0x80)))
+                    .wrapping_add(self.header_table_offset);
+            'file_decryptor: for info_offset in
+                [off_compressed_info, off_compressed_info.wrapping_sub(8)]
             {
-                if self.pe32_file_lfsr_validates(eighth_start.wrapping_add(cand), ci_slot) {
-                    chosen = Some(cand);
-                    break;
+                let info_slot = eighth_start.wrapping_add(info_offset);
+                let table = get_u32(&self.decompressed, info_slot);
+                let mut data_offsets = vec![classic_offset];
+                if table as usize + 4 <= self.decompressed.len() {
+                    let first_source = trial_decrypt5_u32(&self.decompressed, table);
+                    if let Some(file_offset) = prot_rva_to_off(self.file_data, pe_off, first_source)
+                    {
+                        let derived = file_offset.wrapping_sub(first_source);
+                        if derived != classic_offset {
+                            data_offsets.push(derived);
+                        }
+                    }
                 }
-                scan = cand + 1;
+                for data_offset in data_offsets {
+                    self.compressed_data_offset = data_offset;
+                    for start in [off_zero_list.wrapping_add(8), 0] {
+                        let mut scan = start;
+                        while let Some(candidate) = layout::find_lfsr_block(
+                            &self.decompressed,
+                            eighth_start,
+                            eighth_dsz,
+                            scan,
+                            false,
+                        ) {
+                            if self.pe32_file_lfsr_validates(
+                                eighth_start.wrapping_add(candidate),
+                                info_slot,
+                            ) {
+                                off_compressed_info = info_offset;
+                                chosen = Some(candidate);
+                                break 'file_decryptor;
+                            }
+                            scan = candidate.wrapping_add(1);
+                        }
+                    }
+                }
+            }
+            if verbose && let Some(offset) = chosen {
+                println!(
+                    "  fileLFSR +0x{offset:X}, compressedInfo slot +0x{off_compressed_info:X}"
+                );
             }
             chosen.ok_or(UnpackError::Pe32FileLfsrNotFound)?
         };
+        if off_compressed_info != compressed_info_default {
+            let delta = compressed_info_default.wrapping_sub(off_compressed_info);
+            off_file_cs = off_file_cs.wrapping_sub(delta);
+            off_zero_list = off_zero_list.wrapping_sub(delta);
+            if verbose {
+                println!(
+                    "  cluster tail shifted by -0x{delta:X}: fileCS +0x{off_file_cs:X}, zeroList +0x{off_zero_list:X}"
+                );
+            }
+        }
         let file_dec_addr = eighth_start.wrapping_add(lfsr_off);
         self.decrypt_data6(file_dec_addr);
         let file_ops = generate(&self.decompressed, file_dec_addr).ok_or(
@@ -609,16 +891,32 @@ impl<'a> Unpacker<'a> {
         )?;
 
         // ---- PE32 metadata: EP and data dirs from info[3] ----
+        let plain_shell = self.header_table_offset != super::super::super::HEADER_TABLE_OFF;
+        let info3 = if plain_shell && metadata_pointer > 0x1000 {
+            metadata_pointer.wrapping_sub(0x10)
+        } else {
+            info3
+        };
         let test_val = get_u32(&self.decompressed, info3.wrapping_add(0x10));
         let metadata_ep: u32;
         let mut metadata_dirs = [0u8; 128];
+        let metadata_shift = if plain_shell {
+            0
+        } else if old_layout {
+            0x10
+        } else {
+            0
+        };
         if test_val > 0x10000 {
             // Layout B
             let s = info3.wrapping_add(0x10) as usize;
             let backup_meta = self.decompressed[s..s + 0x290].to_vec();
             self.decrypt_data5(info3.wrapping_add(0x10), 0x290);
-            metadata_ep = get_u32(&self.decompressed, info3.wrapping_add(0x20));
-            let d = info3.wrapping_add(0x30) as usize;
+            metadata_ep = get_u32(
+                &self.decompressed,
+                info3.wrapping_add(0x20 + metadata_shift),
+            );
+            let d = info3.wrapping_add(0x30 + metadata_shift) as usize;
             metadata_dirs.copy_from_slice(&self.decompressed[d..d + 128]);
             self.decompressed[s..s + 0x290].copy_from_slice(&backup_meta);
         } else {
@@ -626,8 +924,11 @@ impl<'a> Unpacker<'a> {
             let s = info3.wrapping_add(0x40) as usize;
             let backup_meta = self.decompressed[s..s + 144].to_vec();
             self.decrypt_data5(info3.wrapping_add(0x40), 144);
-            metadata_ep = get_u32(&self.decompressed, info3.wrapping_add(0x40));
-            let d = info3.wrapping_add(0x50) as usize;
+            metadata_ep = get_u32(
+                &self.decompressed,
+                info3.wrapping_add(0x40 + metadata_shift),
+            );
+            let d = info3.wrapping_add(0x50 + metadata_shift) as usize;
             metadata_dirs.copy_from_slice(&self.decompressed[d..d + 128]);
             self.decompressed[s..s + 144].copy_from_slice(&backup_meta);
         }
@@ -655,7 +956,7 @@ impl<'a> Unpacker<'a> {
         if verbose {
             println!("[6/9] Loading and decompressing file data (PE32)...");
         }
-        let compress_data_offset = (!get_u32(self.file_data, 0x1080)).wrapping_add(0x1000);
+        let mut compress_data_offset = self.compressed_data_offset;
         let compressed_info_addr = eighth_start.wrapping_add(off_compressed_info);
         let mut compressed_info = get_u32(&self.decompressed, compressed_info_addr);
         // Pass 1 (sequential): position-keyed descriptor chain (decrypt_data5),
@@ -667,7 +968,19 @@ impl<'a> Unpacker<'a> {
             dsz: u32,
         }
         let mut blocks: Vec<Blk> = Vec::new();
+        let compressed_info_bytes =
+            get_u32(&self.decompressed, compressed_info_addr.wrapping_add(4));
+        let max_blocks = if compressed_info_bytes >= 16 {
+            (compressed_info_bytes / 16) as usize
+        } else {
+            1 << 20
+        };
         loop {
+            if blocks.len() >= max_blocks
+                || (compressed_info as usize).saturating_add(16) > self.decompressed.len()
+            {
+                break;
+            }
             self.decrypt_data5(compressed_info, 16);
             let src2 = get_u32(&self.decompressed, compressed_info);
             let s_sz2 = get_u32(&self.decompressed, compressed_info.wrapping_add(4));
@@ -683,6 +996,34 @@ impl<'a> Unpacker<'a> {
                 dst: dst2,
                 dsz: d_sz2,
             });
+        }
+        if plain_shell {
+            let resolved: Option<Vec<u32>> = blocks
+                .iter()
+                .map(|block| prot_rva_to_off(self.file_data, pe_off, block.src))
+                .collect();
+            if let Some(file_offsets) = resolved {
+                for (block, file_offset) in blocks.iter_mut().zip(file_offsets) {
+                    block.src = file_offset;
+                }
+                compress_data_offset = 0;
+            }
+        }
+        if verbose {
+            println!("  blocks = {}", blocks.len());
+        }
+        let stub_restore = if plain_shell {
+            find_stub_restore(self.file_data, pe_off)
+        } else {
+            None
+        };
+        if verbose && let Some(restore) = stub_restore {
+            println!(
+                "  stub restore: {:#x}..{:#x} <- {:#x}",
+                restore.dst,
+                restore.dst.wrapping_add(restore.len),
+                restore.src
+            );
         }
         // Pass 2: independent per-block work over disjoint dst spans (see
         // `parallel_for` for how the spans are carved safely).
@@ -707,6 +1048,18 @@ impl<'a> Unpacker<'a> {
                 let rel = b.dst as usize - base;
                 let n = b.ssz as usize;
                 span[rel..rel + n].copy_from_slice(&clean[file_src..file_src + n]);
+                if let Some(restore) = stub_restore {
+                    let overlap_start = file_src.max(restore.dst as usize);
+                    let overlap_end =
+                        (file_src + n).min(restore.dst as usize + restore.len as usize);
+                    if overlap_start < overlap_end {
+                        let destination = rel + (overlap_start - file_src);
+                        let source = restore.src as usize + (overlap_start - restore.dst as usize);
+                        let len = overlap_end - overlap_start;
+                        span[destination..destination + len]
+                            .copy_from_slice(&clean[source..source + len]);
+                    }
+                }
                 primitives::aes_decrypt_ks(&ks_snap, span, rel as u32, b.ssz);
                 lut.map_region(span, rel, n);
                 if b.ssz != b.dsz {

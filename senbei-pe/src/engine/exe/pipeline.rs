@@ -34,6 +34,66 @@ fn prot_rva_to_off(file_data: &[u8], pe_header: u32, rva: u32) -> Option<u32> {
     None
 }
 
+#[derive(Clone, Copy)]
+struct StubRestore {
+    dst: u32,
+    src: u32,
+    len: u32,
+}
+
+/// Recover the displaced-byte copy performed by the earliest plain-shell
+/// entry stub. That stub overlaps its compressed stream and restores the
+/// original bytes from a shell-resident blob before reading the stream.
+fn find_stub_restore(file_data: &[u8], pe_off: u32) -> Option<StubRestore> {
+    const PATTERN_LEN: usize = 37;
+    let mut hit: Option<(u32, u32, u32)> = None;
+    for window in file_data.windows(PATTERN_LEN) {
+        if window[0..6] != [0x8B, 0x55, 0x08, 0x8B, 0x45, 0x0C]
+            || window[6] != 0xBF
+            || window[11] != 0xB9
+            || window[16..18] != [0x81, 0xEF]
+            || window[22..24] != [0x81, 0xE9]
+            || window[28..30] != [0x03, 0xFA]
+            || window[30] != 0xBE
+            || window[35..37] != [0x03, 0xF8]
+        {
+            continue;
+        }
+        let immediate = |offset: usize| {
+            u32::from_le_bytes([
+                window[offset],
+                window[offset + 1],
+                window[offset + 2],
+                window[offset + 3],
+            ])
+        };
+        let (src, end, anchor) = (immediate(7), immediate(12), immediate(18));
+        if immediate(24) != src || immediate(31) != src || anchor < src || anchor >= end {
+            continue;
+        }
+        if hit.is_some_and(|previous| previous != (src, end, anchor)) {
+            return None;
+        }
+        hit = Some((src, end, anchor));
+    }
+    let (src_va, end_va, anchor_va) = hit?;
+    let len = end_va.wrapping_sub(src_va);
+    let image_base = get_u32(file_data, pe_off.wrapping_add(0x34));
+    let entry = get_u32(file_data, pe_off.wrapping_add(0x28));
+    let dst_va = src_va
+        .wrapping_sub(anchor_va)
+        .wrapping_add(image_base)
+        .wrapping_add(entry);
+    let src = prot_rva_to_off(file_data, pe_off, src_va.checked_sub(image_base)?)?;
+    let dst = prot_rva_to_off(file_data, pe_off, dst_va.checked_sub(image_base)?)?;
+    if (src as usize).checked_add(len as usize)? > file_data.len()
+        || (dst as usize).checked_add(len as usize)? > file_data.len()
+    {
+        return None;
+    }
+    Some(StubRestore { dst, src, len })
+}
+
 pub fn unpack_v(input: &[u8], verbose: bool) -> Result<Vec<u8>, UnpackError> {
     const HEADER_LEN: usize = 4128;
     if input.len() < HEADER_LEN {
@@ -59,6 +119,8 @@ struct Unpacker<'a> {
     info: [u32; 8],
     key_offsets: [u32; 4],
     decrypt_size: u32,
+    header_table_offset: u32,
+    compressed_data_offset: u32,
 }
 
 impl<'a> Unpacker<'a> {
@@ -89,11 +151,6 @@ impl<'a> Unpacker<'a> {
                 },
             },
         )
-    }
-
-    // Strategy (a): delegate to primitives::decrypt_data1
-    fn decrypt_data(&mut self) {
-        primitives::decrypt_data1(self.file_data, &mut self.info);
     }
 
     // Strategy (b): decrypt_data2 is tightly coupled to Unpacker fields
@@ -319,6 +376,34 @@ impl<'a> Unpacker<'a> {
         }
     }
 
+    /// Map raw sections into their virtual addresses, excluding the range
+    /// owned by the encrypted payload stages.
+    fn map_raw_sections(&mut self, pe_off: u32, payload_lo: usize, payload_hi: usize) {
+        let optional_size = get_u16(self.file_data, pe_off.wrapping_add(20)) as u32;
+        let section_table = pe_off.wrapping_add(24).wrapping_add(optional_size);
+        let section_count = get_u16(self.file_data, pe_off.wrapping_add(6)) as u32;
+        for index in 0..section_count.min(96) {
+            let section = section_table.wrapping_add(index.wrapping_mul(40));
+            if section as usize + 40 > self.file_data.len() {
+                break;
+            }
+            let virtual_size = get_u32(self.file_data, section.wrapping_add(8)) as usize;
+            let virtual_address = get_u32(self.file_data, section.wrapping_add(12)) as usize;
+            let raw_size = get_u32(self.file_data, section.wrapping_add(16)) as usize;
+            let raw_offset = get_u32(self.file_data, section.wrapping_add(20)) as usize;
+            let len = raw_size.min(virtual_size);
+            if len == 0
+                || raw_offset.saturating_add(len) > self.file_data.len()
+                || virtual_address.saturating_add(len) > self.decompressed.len()
+                || (virtual_address < payload_hi && payload_lo < virtual_address + len)
+            {
+                continue;
+            }
+            self.decompressed[virtual_address..virtual_address + len]
+                .copy_from_slice(&self.file_data[raw_offset..raw_offset + len]);
+        }
+    }
+
     fn run(file_data: &'a [u8], verbose: bool) -> Result<Vec<u8>, UnpackError> {
         let mut u = Unpacker {
             file_data,
@@ -326,9 +411,14 @@ impl<'a> Unpacker<'a> {
             info: [0u32; 8],
             key_offsets: [0u32; 4],
             decrypt_size: 0,
+            header_table_offset: super::super::HEADER_TABLE_OFF,
+            compressed_data_offset: 0,
         };
 
-        u.decrypt_data();
+        let (keys, header_table_offset) =
+            super::super::header_table(file_data).ok_or(UnpackError::NotCrackproof)?;
+        u.info = keys;
+        u.header_table_offset = header_table_offset;
         if verbose {
             println!("[1/9] Decrypting file header...");
             println!("  info[0] key        = 0x{:08X}", u.info[0]);
@@ -362,6 +452,29 @@ impl<'a> Unpacker<'a> {
             });
         }
         u.decompressed = vec![0u8; size_of_image as usize];
+
+        // Earlier PE32 builds store the shell and its stage ciphertext directly
+        // in the file. Mapping the sections recreates the loader view; the
+        // config block's self-reference supplies the otherwise absent shell RVA.
+        if header_table_offset != super::super::HEADER_TABLE_OFF {
+            if get_u16(u.file_data, pe_off.wrapping_add(24)) != 0x10B {
+                return Err(UnpackError::Pe32TblNotFound);
+            }
+            let header_len = (get_u32(u.file_data, pe_off.wrapping_add(84)) as usize)
+                .min(u.file_data.len())
+                .min(u.decompressed.len());
+            u.decompressed[..header_len].copy_from_slice(&u.file_data[..header_len]);
+            u.map_raw_sections(pe_off, 0, 0);
+            u.info[6] = layout::find_plain_shell_anchor(&u.decompressed)
+                .ok_or(UnpackError::Pe32TblNotFound)?;
+            u.info[5] = 0;
+            u.decrypt_size = 0;
+            if verbose {
+                println!("[2/9] Payload is plain in file; mapped sections.");
+                println!("  shell = 0x{:08X}", u.info[6]);
+            }
+            return u.run_pe32(pe_off, verbose);
+        }
         u.decrypt_size = u.info[6].wrapping_sub(u.info[3]).wrapping_add(8192);
         if verbose {
             println!("[2/9] Decrypting payload...");
@@ -1794,7 +1907,7 @@ impl<'a> Unpacker<'a> {
             None => return false,
         };
 
-        let cdo = (!get_u32(self.file_data, 0x1080)).wrapping_add(0x1000);
+        let cdo = self.compressed_data_offset;
         let table = get_u32(&self.decompressed, ci_slot);
         if table == 0 || table as usize + 16 > self.decompressed.len() {
             return false;

@@ -196,13 +196,39 @@ pub struct Detected {
 // Content-based detection
 // ---------------------------------------------------------------------------
 
-/// Derive the 8-element Crackproof key table from the header at offset 4096.
-/// Returns `None` if the input is too short or doesn't have a valid PE signature.
-fn key_table(input: &[u8]) -> Option<[u32; 8]> {
-    // Need at least 4128 bytes: the key-table loop below reads dwords up to
-    // offset 4124 (bytes 4124..4127). Guarding only `< 4096` would let a
-    // 4096..4127-byte PE (e.g. a 4 KiB stub) panic in `get_u32`.
-    if input.len() < 4128 {
+/// File offset of the header key table in the usual layouts.
+pub(crate) const HEADER_TABLE_OFF: u32 = 0x1000;
+
+/// Upper bound for the fallback header-table scan. Plain-shell PE32 builds
+/// embed the table near the entry stub, so a small bounded window covers it.
+const HEADER_TABLE_SCAN_END: u32 = 0x4000;
+
+fn key_table_at(input: &[u8], off: u32) -> Option<[u32; 8]> {
+    if (off as usize)
+        .checked_add(32)
+        .is_none_or(|end| end > input.len())
+    {
+        return None;
+    }
+    let mut keys = [0u32; 8];
+    keys[0] = primitives::get_u32(input, off);
+    let mut k = keys[0];
+    for i in 0u32..7 {
+        let cell = primitives::get_u32(input, off.wrapping_add(4 + i * 4));
+        keys[(i + 1) as usize] = k ^ cell;
+        k = i.wrapping_mul(i) ^ (k.wrapping_add(cell).wrapping_sub(i));
+    }
+    Some(keys)
+}
+
+/// Locate and derive the protected header key table.
+///
+/// Usual layouts use [`HEADER_TABLE_OFF`]. An earlier PE32 family instead
+/// carries redundant tables inline in its entry stub. The magic validates each
+/// candidate, and the fixed location is always tried first to preserve existing
+/// output behavior.
+pub(crate) fn header_table(input: &[u8]) -> Option<([u32; 8], u32)> {
+    if input.len() < 0x40 {
         return None;
     }
     // Validate the PE signature with checked arithmetic so a crafted offset
@@ -215,16 +241,25 @@ fn key_table(input: &[u8]) -> Option<[u32; 8]> {
     if &input[pe_start..pe_start + 4] != b"PE\0\0" {
         return None;
     }
-    // Derive 8 keys per the Crackproof header-key formula.
-    let mut keys = [0u32; 8];
-    keys[0] = primitives::get_u32(input, 4096);
-    let mut k = keys[0];
-    for i in 0u32..7 {
-        let cell = primitives::get_u32(input, 4100u32.wrapping_add(i.wrapping_mul(4)));
-        keys[(i + 1) as usize] = k ^ cell;
-        k = i.wrapping_mul(i) ^ (k.wrapping_add(cell).wrapping_sub(i));
+    if let Some(keys) = key_table_at(input, HEADER_TABLE_OFF)
+        && is_supported_magic(keys[1])
+    {
+        return Some((keys, HEADER_TABLE_OFF));
     }
-    Some(keys)
+    let mut off = 0u32;
+    while off < HEADER_TABLE_SCAN_END {
+        if let Some(keys) = key_table_at(input, off)
+            && is_supported_magic(keys[1])
+        {
+            return Some((keys, off));
+        }
+        off = off.wrapping_add(4);
+    }
+    None
+}
+
+fn key_table(input: &[u8]) -> Option<[u32; 8]> {
+    header_table(input).map(|(keys, _)| keys)
 }
 
 /// Detect whether `input` is a Crackproof-protected binary and classify it.
@@ -332,6 +367,27 @@ pub fn unpack_auto_v(input: &[u8], verbose: bool) -> Result<(Kind, Vec<u8>), Unp
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn detects_inline_header_table() {
+        let mut input = vec![0u8; 0x5000];
+        primitives::write_u32(&mut input, 0x3C, 0x80);
+        input[0x80..0x84].copy_from_slice(b"PE\0\0");
+        primitives::write_u16(&mut input, 0x80 + 24, 0x10B);
+
+        let table = 0x1200;
+        let seed = 0x1234_5678;
+        primitives::write_u32(&mut input, table, seed);
+        primitives::write_u32(&mut input, table + 4, seed ^ MAGIC_KONN);
+
+        let (keys, offset) = header_table(&input).expect("inline table should be detected");
+        assert_eq!(offset, table);
+        assert_eq!(keys[1], MAGIC_KONN);
+        assert_eq!(
+            detect(&input).map(|detected| detected.kind),
+            Some(Kind::NativeExe)
+        );
+    }
 
     #[test]
     fn caught_panic_reports_location_and_message() {
