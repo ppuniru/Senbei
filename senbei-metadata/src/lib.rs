@@ -1,5 +1,9 @@
-//! Unity il2cpp metadata de-obfuscation.
+//! Unity il2cpp metadata restoration.
 
-mod metadata;
+pub mod android;
+mod common;
+mod structural;
+pub mod windows;
 
-pub use metadata::*;
+pub use common::is_metadata;
+pub use structural::*;

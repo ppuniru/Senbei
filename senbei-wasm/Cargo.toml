@@ -1,7 +1,8 @@
 [package]
 name = "senbei-wasm"
-version = "1.2.0"
+version = "1.3.2"
 edition = "2024"
+rust-version = "1.98.1"
 description = "WebAssembly bindings for senbei (browser frontend assets live in web/)"
 license = "AGPL-3.0-only"
 
@@ -11,7 +12,7 @@ crate-type = ["cdylib"]
 [dependencies]
 senbei-io = { path = "../senbei-io" }
 senbei-metadata = { path = "../senbei-metadata" }
-senbei-pe = { path = "../senbei-pe" }
+senbei-engine = { path = "../senbei-engine" }
 wasm-bindgen = "0.2"
 console_error_panic_hook = "0.1"
 
