@@ -1085,6 +1085,31 @@ impl<'a> Unpacker<'a> {
                     bc2_search_len.saturating_mul(2),
                 )
             })
+            .or_else(|| {
+                if new_layout {
+                    return None;
+                }
+                // Some layouts align the file decryptor independently of the
+                // preceding marker. Preserve established choices, then prove
+                // each additional candidate against a compressed section.
+                let rebase = (!get_u32(u.file_data, 4224)).wrapping_add(4096);
+                let mut ks = [0u8; 256];
+                lfsr_keystream(&mut ks);
+                unaligned_bytecode_candidates(&u.decompressed, bc2_search_base, bc2_search_len)
+                    .into_iter()
+                    .find(|&candidate| {
+                        let pos = candidate as usize;
+                        let count = u.decompressed[pos + 95] as usize;
+                        let mut decoded = [0u8; 256];
+                        for index in 0..count {
+                            decoded[index] = u.decompressed[pos + index] ^ ks[index];
+                        }
+                        generate(&decoded[..count], 0).is_some_and(|ops| {
+                            u.file_checksum_table_validates(candidate)
+                                && u.file_ops_validate(walk4_slot, &ops, rebase, true)
+                        })
+                    })
+            })
             .unwrap_or_else(|| s5_marker.wrapping_add(960));
         // walk4 is the section-load (compressedInfo) descriptor table; in the
         // old layout it sits at a fixed offset from the kind-marker.
@@ -1168,6 +1193,9 @@ impl<'a> Unpacker<'a> {
         }
 
         let data_offset2 = bc2_off;
+        if verbose {
+            println!("  section bytecode = 0x{data_offset2:08X}");
+        }
         // fileCS chain: the file-checksum table is permanently decrypted in
         // place. Its pointer lives 0x58 bytes before the file LFSR/decryptor
         // block (fileDecryptorAddress = fileChecksumAddresses + 0x58). Walk
@@ -1194,7 +1222,7 @@ impl<'a> Unpacker<'a> {
         // would garble every section block, and raw blocks would carry that
         // garbling into the output without any error (see the validator).
         let rebase = (!get_u32(u.file_data, 4224)).wrapping_add(4096);
-        if new_layout && !u.new_layout_file_ops_validate(walk4_slot, &ops2, rebase) {
+        if new_layout && !u.file_ops_validate(walk4_slot, &ops2, rebase, false) {
             return Err(UnpackError::FileDecryptorValidationFailed);
         }
 
@@ -1800,7 +1828,7 @@ impl<'a> Unpacker<'a> {
         Ok(u.decompressed)
     }
 
-    /// Validate the new-layout (marker-less) file-decryptor choice by
+    /// Validate a file-decryptor choice by
     /// trial-decompression, same approach as [`Self::pe32_file_lfsr_validates`].
     ///
     /// The marker-less discovery picks the file LFSR by *distance* (the LFSR
@@ -1815,9 +1843,15 @@ impl<'a> Unpacker<'a> {
     /// `walk4_slot` holds the compressedInfo table pointer; entries are read
     /// with the non-mutating `trial_decrypt5_u32` (the position-keyed cipher
     /// has no cross-byte state, so trial reads equal the real pass's
-    /// in-place decrypts). Returns `true` when no compressed block exists
-    /// (nothing to validate against).
-    fn new_layout_file_ops_validate(&mut self, walk4_slot: u32, ops: &[Op], rebase: u32) -> bool {
+    /// in-place decrypts). Off-stride candidates require an actual compressed
+    /// block; established marker-less discovery also permits raw-only images.
+    fn file_ops_validate(
+        &mut self,
+        walk4_slot: u32,
+        ops: &[Op],
+        rebase: u32,
+        require_compressed: bool,
+    ) -> bool {
         let mut walk4 = get_u32(&self.decompressed, walk4_slot);
         for _ in 0..4096 {
             if walk4 as usize + 16 > self.decompressed.len() {
@@ -1828,7 +1862,7 @@ impl<'a> Unpacker<'a> {
             let dst = trial_decrypt5_u32(&self.decompressed, walk4.wrapping_add(8));
             let plain_len = trial_decrypt5_u32(&self.decompressed, walk4.wrapping_add(12));
             if len == 0 {
-                return true; // terminator: no compressed block to validate against
+                return !require_compressed;
             }
             if len != plain_len {
                 let cs = src.wrapping_add(rebase) as usize;
@@ -1864,7 +1898,33 @@ impl<'a> Unpacker<'a> {
             }
             walk4 = walk4.wrapping_add(16);
         }
-        true
+        !require_compressed
+    }
+
+    // Selecting a byte transform also selects the preceding checksum table.
+    // Prove that its walk terminates before allowing permanent in-place edits.
+    fn file_checksum_table_validates(&self, bytecode: u32) -> bool {
+        let Some(slot) = bytecode.checked_sub(0x58) else {
+            return false;
+        };
+        let mut table = get_u32(&self.decompressed, slot) as usize;
+        if table < 0x1000 {
+            return false;
+        }
+        let bytecode_end = bytecode as usize + self.decompressed[bytecode as usize + 95] as usize;
+        for _ in 0..4096 {
+            let Some(record) = self.decompressed.get(table..table.saturating_add(16)) else {
+                return false;
+            };
+            if table < bytecode_end && table + 16 > bytecode as usize {
+                return false;
+            }
+            if get_u32(record, 4) == 0 {
+                return true;
+            }
+            table += 16;
+        }
+        false
     }
 
     /// Validate a candidate PE32 file-decryptor LFSR block by trial-decompression.
@@ -2108,6 +2168,37 @@ impl<'a> Unpacker<'a> {
 #[cfg(test)]
 mod error_tests {
     use super::*;
+
+    #[test]
+    fn unaligned_validation_requires_a_compressed_block() {
+        let mut u = Unpacker {
+            file_data: &[],
+            decompressed: vec![0u8; 0x1100],
+            info: [0; 8],
+            key_offsets: [0; 4],
+            decrypt_size: 0,
+            header_table_offset: 0,
+            compressed_data_offset: 0,
+        };
+        write_u32(&mut u.decompressed, 0x80, 0x1000);
+        for address in 0x1000..0x1010usize {
+            let key = address as u8;
+            u.decompressed[address] = (key.rotate_right(2) ^ key.wrapping_add(1)).rotate_right(2);
+        }
+        let snapshot = u.decompressed.clone();
+        assert!(u.file_ops_validate(0x80, &[], 0, false));
+        assert!(!u.file_ops_validate(0x80, &[], 0, true));
+        assert_eq!(u.decompressed, snapshot);
+
+        write_u32(&mut u.decompressed, 0x1080 - 0x58, 0x1000);
+        u.decompressed[0x1080 + 95] = 9;
+        write_u32(&mut u.decompressed, 0x1004, 0);
+        assert!(u.file_checksum_table_validates(0x1080));
+        write_u32(&mut u.decompressed, 0x1080 - 0x58, 0x1080);
+        assert!(!u.file_checksum_table_validates(0x1080));
+        write_u32(&mut u.decompressed, 0x1080 - 0x58, 0x1100);
+        assert!(!u.file_checksum_table_validates(0x1080));
+    }
 
     #[test]
     fn short_input_reports_actual_and_required_lengths() {

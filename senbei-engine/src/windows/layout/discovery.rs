@@ -92,6 +92,40 @@ pub fn find_bytecode_offset(data: &[u8], base: u32, len: u32) -> Option<u32> {
     None
 }
 
+/// Marker-relative alignment can change when the preceding string table grows.
+/// Return every off-stride program so the caller can trial-decompress sections
+/// with each candidate instead of trusting the first parseable byte sequence.
+pub fn unaligned_bytecode_candidates(data: &[u8], base: u32, len: u32) -> Vec<u32> {
+    let start = base as usize;
+    let end = base.saturating_add(len) as usize;
+    let Some(region) = data.get(start..end) else {
+        return Vec::new();
+    };
+    let mut ks = [0u8; 256];
+    lfsr_keystream(&mut ks);
+    let mut candidates = Vec::new();
+    for offset in 0..region.len().saturating_sub(95) {
+        if offset % 16 == 0 {
+            continue;
+        }
+        let count = region[offset + 95] as usize;
+        let Some(ciphertext) = region.get(offset..offset + count) else {
+            continue;
+        };
+        if count < 8 {
+            continue;
+        }
+        let mut decoded = [0u8; 256];
+        for (index, &byte) in ciphertext.iter().enumerate() {
+            decoded[index] = byte ^ ks[index];
+        }
+        if parse_bytecode_check(&decoded[..count]).is_some_and(|ops| ops >= 4) {
+            candidates.push((start + offset) as u32);
+        }
+    }
+    candidates
+}
+
 /// Validate bytecode structure without allocating a `Vec` of ops. Returns
 /// `Some(non_nop_op_count)` if the byte stream parses successfully as a valid
 /// opcode sequence ending in 195 (ret), `None` otherwise. Allows non-trivial
@@ -540,6 +574,29 @@ pub fn discover_eighth_slots(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bytecode_candidates_recover_shifted_blocks() {
+        let base = 0x100u32;
+        let mut data = vec![0u8; 0x300];
+        let plain = [4, 1, 4, 2, 4, 3, 4, 4, 195, 0];
+        let mut ks = [0u8; 256];
+        lfsr_keystream(&mut ks);
+        for position in [0x148usize, 0x208] {
+            for (index, byte) in plain.iter().enumerate() {
+                data[position + index] = byte ^ ks[index];
+            }
+            data[position + 95] = plain.len() as u8;
+        }
+        assert_eq!(find_bytecode_offset(&data, base, 0x200), None);
+        assert_eq!(
+            unaligned_bytecode_candidates(&data, base, 0x200),
+            vec![0x148, 0x208]
+        );
+        assert!(unaligned_bytecode_candidates(&data, base, 95).is_empty());
+        assert!(unaligned_bytecode_candidates(&data, base, 0x201).is_empty());
+        assert!(unaligned_bytecode_candidates(&data, u32::MAX, 96).is_empty());
+    }
 
     /// Task 4.1 regression: build a synthetic buffer whose valid bytecode block
     /// sits PAST `len` but within `len*2`. Assert that the smaller window misses
